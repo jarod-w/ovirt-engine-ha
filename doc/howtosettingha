@@ -1,0 +1,363 @@
+[[TOC]]
+
+== Install CentOS
+=== System Requirements
+  * Now, I tested it only on centos 6.3.
+  * If we need to support other os version, please let me know.
+=== Install Requirements
+  * You MUST customize disk to free at least volume which will
+  be used by drbd.
+  * It's better to install using minimize installation mode
+
+== Building Basic Env
+
+=== Setting Env
+  * Configure Network
+  * Disable Selinux
+{#!sh
+sed -i 's/=enforcing/=disabled/g' /etc/selinux/config
+}
+  * Disable iptables
+{#!sh
+/etc/init.d/iptables stop
+chkconfig iptables off
+}
+  * reboot
+{#!sh
+reboot
+}
+
+Note:
+You must do above steps, or you'll get the following error information
+in log file after starting corosync.
+{#!sh
+Totem is unable to form a cluster because of an operating system or network
+fault. The most common cause of this message is that the local firewall is
+configured improperly.
+}
+
+=== Install Components
+  * Install basic packages
+{{{#!sh
+yum install -y openssh-clients wget vim
+}}}
+  * Install pacemaker
+{{{#!sh
+yum install -y pacemaker
+}}}
+  * Install DRBD
+{{{#!sh
+rpm -Uvh http://elrepo.org/elrepo-release-6-4.el6.elrepo.noarch.rpm
+sed -i 's/enabled=1/enabled=0/g' /etc/yum.repos.d/elrepo.repo
+yum --enablerepo=elrepo install drbd83-utils kmod-drbd83 -y
+}}}
+  * Install ovirt-engine
+{{{#!sh
+cd /etc/yum.repos.d/
+wget http://192.168.0.200/BACKUP2/IMVP/bell/nightly-build/cloudtimes.repo
+yum install -y ovirt-engine ovirt-engine-setup
+}}}
+
+== Configure Basic Components
+
+=== Disable all the service related with ovirt-engine
+{{{#!sh
+chkconfig httpd off
+chkconfig drbd off
+chkconfig postgresql off
+chkconfig ovirt-engine off
+chkconfig corosync on
+}}}
+
+=== Configure Pacemaker
+  * update your /etc/hosts on both hosts as the following:
+{{{#!sh
+127.0.0.1   localhost localhost.localdomain localhost4 localhost4.localdomain4
+::1         localhost localhost.localdomain localhost6 localhost6.localdomain6
+192.168.0.211 hafinal1.ct.com
+192.168.0.212 hafinal2.ct.com
+}}}
+
+  * update your corosync conf file as the following:
+{{{#!sh
+# Please read the corosync.conf.5 manual page
+compatibility: whitetank
+aisexec{
+user: root
+group: root
+}
+service{
+name: pacemaker
+ver: 0
+}
+
+totem {
+	version: 2
+	secauth: off
+	threads: 0
+	interface {
+		ringnumber: 0
+		bindnetaddr: 192.168.0.0
+		mcastaddr: 226.94.1.4
+		mcastport: 5409
+		ttl: 1
+                member {
+			memberaddr: 192.168.0.211
+		}
+                member {
+			memberaddr: 192.168.0.212
+		}
+	}
+}
+
+logging {
+	fileline: off
+	to_stderr: no
+	to_logfile: yes
+	to_syslog: yes
+	logfile: /var/log/cluster/corosync.log
+	debug: off
+	timestamp: on
+	logger_subsys {
+		subsys: AMF
+		debug: off
+	}
+}
+
+amf {
+	mode: disabled
+}
+
+}}}
+  * start corosync service
+{{{#!sh
+    /etc/init.d/corosync start
+}}}
+  * make sure whether crm is normal.
+{{{#!sh
+crm_verify -L
+}}}
+  Note:if the command above show the following result:
+{{{#!sh
+   error: unpack_resources:     Resource start-up disabled since no STONITH resources have been defined
+   error: unpack_resources:  Either configure some or disable STONITH with the stonith-enabled option
+   error: unpack_resources:       NOTE: Clusters with shared data need STONITH to ensure data integrity
+   Errors found during check: config not valid
+     -V may provide more details
+}}}
+  then, you can disable the STONITH using the command below:
+{{{#!sh
+    crm configure property stonith-enabled=false
+}}}
+  * add ipaddr2 resource
+To add it, you can run the following command:
+{{{#!sh
+crm configure primitive HAIP ocf:heartbeat:IPaddr2 \
+     params ip=10.0.0.190 cidr_netmask=24 \
+     op monitor interval=30s
+}}}
+
+To work normally, you MUST ignore quorum policy using the command below:
+{{{#!sh
+crm configure property no-quorum-policy=ignore
+}}}
+
+=== Configure DRBD
+  * create resource file on both hosts as the following:
+{{{#!sh
+resource r0{
+  device /dev/drbd_r0 minor 0;
+  disk /dev/vda3;
+  meta-disk internal;
+  on hafinal1.ct.com{
+    address 192.168.0.211:7788;
+  }
+  on hafinal2.ct.com{
+    address 192.168.0.212:7788;
+  }
+  syncer {
+    rate 7M;
+  }
+}
+}}}
+  * create meta-data on both hosts.
+{{{#!sh
+    drbdadm create-md r0
+}}}
+  If it can't success, and reports the following information:
+{{{#!sh
+md_offset 10463735808
+al_offset 10463703040
+bm_offset 10463383552
+
+Found ext3 filesystem
+    10218496 kB data area apparently used
+    10218148 kB left usable by current configuration
+
+    Device size would be truncated, which
+    would corrupt data and result in
+    'access beyond end of device' errors.
+    You need to either
+       * use external meta data (recommended)
+       * shrink that filesystem first
+       * zero out the device (destroy the filesystem)
+    Operation refused.
+
+    Command 'drbdmeta 0 v08 /dev/vda3 internal create-md' terminated with exit code 40
+    drbdadm create-md r0: exited with code 40
+}}}
+You can clear the disk using dd command as:
+{{{#!sh
+dd if=/dev/zero bs=1M count=1 of=/dev/vda3
+}}}
+Then, please go on running the command to create meta-data.
+  * put the resource(r0) up on both hosts.
+{{{#!sh
+    drbdadm up r0
+}}}
+  * make the initial sync between the nodes
+{{{#!sh
+drbdadm -- --overwrite-data-of-peer primary r0
+}}}
+  Note:We should run it on the one of two hosts(The host is primary host.)
+  * start drbd service on both hosts.
+{{{#!sh
+/etc/init.d/drbd start
+}}}
+  * on primary host,format the drbd device
+{{{#!sh
+mkfs.ext3 /dev/drbd_r0
+}}}
+  * on primary host,mount the drbd device
+{{{#!sh
+mount -t ext3 /dev/drbd_r0 /var/lib/pgsql/
+}}}
+  * on primary host, change the owner and group of the mountpoint
+{{{#!sh
+chown postgres.postgres /var/lib/pgsql
+}}}
+
+
+=== Configure Engine
+  * Please run the following command on one of two machines(on primary host)
+{{{#!sh
+engine-setup
+}}}
+  * copy ovirt engine from primary host to secondary host
+    * copy pki files
+    {{{#!sh
+    scp -r /etc/pki/ovirt-engine/ 192.168.0.212:/etc/pki/
+    }}}
+    * copy config files
+    {{{#!sh
+    scp -r /etc/httpd/conf.d/ 192.168.0.212:/etc/httpd/
+    scp -r /etc/sysconfig/ovirt-engine 192.168.0.212:/etc/sysconfig/
+    }}}
+    Note: On secondary host, we should modify /etc/sysconfig/ovirt-engine using the following command:
+    {{{#!sh
+    sed -i '/^ENGINE_FQDN/d' /etc/sysconfig/ovirt-engine
+    VHOSTNAME=`hostname`
+    echo "ENGINE_FQDN=$VHOSTNAME" >> /etc/sysconfig/ovirt-engine
+    }}}
+    * copy jboss modules
+    {{{#!sh
+    scp -r /usr/share/jboss-as/modules 192.168.0.212:/usr/share/jboss-as/
+    }}}
+
+=== Configure PostgreSQL
+  * enable trusted authentication on the nodes and cluster IP's on primary host
+{{{#!sh
+echo "host  all   all   192.168.0.211/32   trust" >> /var/lib/pgsql/data/pg_hba.conf
+echo "host  all   all   192.168.0.212/32   trust" >> /var/lib/pgsql/data/pg_hba.conf
+echo "host  all   all   192.168.0.240/32   trust" >> /var/lib/pgsql/data/pg_hba.conf
+}}}
+  * enable PostgreSQL to listen on all interfaces on primary host
+{{{#!
+vi /var/lib/pgsql/data/postgresql.conf
+listen_addresses = '0.0.0.0' #Uncomment and change only the line:
+}}}
+
+=== Configure Pacemaker
+  * install ovirt-engine-pacemaker package using the command:
+{{{#!
+rpm -Uvh ovirt-engine-pacemaker* --force
+}}}
+
+  * Configuring weight to change the resource to another node
+{{{#!
+crm configure rsc_defaults resource-stickiness=100
+}}}
+  Note: When a node goes down and then goes up, this configuration makes the resource that
+  is running on the another server be kept there (that was always up). This is very good to
+  prevent a sync problem on the node that was down, or prevent that the node that is flapping,
+  flap the cluster services.
+
+  * configure drbd on pacemaker
+{{{#!sh
+crm configure primitive drbd_postgres ocf:linbit:drbd params drbd_resource="r0" op monitor interval="15s"
+crm configure ms ms_drbd_postgres drbd_postgres meta master-max="1" master-node-max="1" clone-max="2" clone-node-max="1" notify="true"
+}}}
+
+  * configure filesystem on pacemaker
+{{{#!sh
+crm configure primitive postgres_fs ocf:heartbeat:Filesystem params device="/dev/drbd_r0" directory="/var/lib/pgsql" fstype="ext3"
+}}}
+
+  * configure postgresql on pacemaker
+{{{#!sh
+crm configure primitive postgresql ocf:heartbeat:pgsql params monitor_user="postgres" monitor_password="abc123linux" op monitor depth="0" timeout="30" interval="30"
+}}}
+  * configure apache on pacemaker
+{{{#!sh
+crm configure primitive httpd ocf:heartbeat:apache params configfile="/etc/httpd/conf/httpd.conf" port="80" op monitor interval="5s" timeout="20s"
+}}}
+  * configure ovirtengine on pacemaker
+{{{#!sh
+crm configure primitive ovirt-engine ocf:heartbeat:OvirtEngine params admin_user="admin@internal" admin_passwd="abc123linux" op monitor depth="0" timeout="30" interval="30"
+}}}
+
+  * group six resources
+{{{#!sh
+crm configure group postgres postgres_fs HAFINALIP postgresql httpd ovirtengine
+}}}
+
+  * Fixing group postgres to run together with DRBD Primary node
+{{{#!sh
+crm configure colocation postgres_on_drbd inf: postgres ms_drbd_postgres:Master
+}}}
+
+  * Configuring postgres to run after DRBD
+{{{#!sh
+crm configure order postgres_after_drbd inf: ms_drbd_postgres:promote postgres:start
+}}}
+
+  * Set the preferential host
+{{{#!sh
+crm configure location master-prefer-node1 HAFINALIP 50: hafinal1.ct.com
+}}}
+
+== Other
+  * If drbd can't sync the data, and running 'cat /proc/drbd', it shows:
+{{{#!
+version: 8.3.15 (api:88/proto:86-97)
+GIT-hash: 0ce4d235fc02b5c53c1c52c53433d11a694eab8c build by phil@Build64R6, 2012-12-20 20:09:51
+ 0: cs:StandAlone ro:Primary/Unknown ds:UpToDate/DUnknown   r-----
+     ns:0 nr:0 dw:11132 dr:3265 al:0 bm:0 lo:0 pe:0 ua:0 ap:0 ep:1 wo:f oos:4984
+}}}
+
+You can use the following method to fix it:
+{{{#!sh
+# on secondary host
+drbdadm secondary all
+drbdadm -- --discard-my-data connect all
+
+# on primary host
+drbdadm connect all
+}}}
+
+  * If running 'crm status' shows the following:
+{{{#!sh
+drbd_postgres_monitor_0 (node=hafinal2.ct.com, call=3, rc=6, status=complete): not configured
+drbd_postgres_monitor_0 (node=hafinal1.ct.com, call=8, rc=6, status=complete): not configured
+}}}
+You can restart two corosync service.
